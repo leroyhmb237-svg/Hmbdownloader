@@ -15,23 +15,42 @@ import threading
 import logging
 import re
 import time
+import shutil
+import platform
 
 from datetime import datetime
 from flask import Flask, jsonify
 
-from telethon import TelegramClient, events
+from telethon import TelegramClient, events, Button
 from telethon.sessions import StringSession
+from telethon.network.connection.tcpabridged import ConnectionTcpAbridged
 
 
 # =========================================================
-# CONFIGURATION LOGGING
+# CONFIGURATION
+# =========================================================
+
+DOWNLOAD_DIR = "/tmp/downloads"
+
+MAX_FILE_SIZE = 500 * 1024 * 1024
+
+FORCE_CHANNEL = "FichierHatunnelPlus"
+
+LOG_FILE = "bot.log"
+
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+
+
+# =========================================================
+# LOGGING
 # =========================================================
 
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.WARNING,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.StreamHandler(sys.stdout)
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler(LOG_FILE)
     ]
 )
 
@@ -51,6 +70,12 @@ download_count = 0
 user_client = None
 bot_client = None
 
+users = set()
+
+banned_users = set()
+
+private_mode = False
+
 
 # =========================================================
 # WEB ROUTES
@@ -69,6 +94,7 @@ def home():
         "creator": "🇭 🇲 🇧",
         "status": "online",
         "downloads": download_count,
+        "users": len(users),
         "uptime": f"{hours}h {minutes}m",
         "timestamp": datetime.now().isoformat()
     })
@@ -76,6 +102,7 @@ def home():
 
 @app.route('/health')
 def health():
+
     return jsonify({
         "status": "healthy"
     }), 200
@@ -83,6 +110,7 @@ def health():
 
 @app.route('/ping')
 def ping():
+
     return "Pong!", 200
 
 
@@ -103,7 +131,7 @@ def run_web():
 
 
 # =========================================================
-# FORMAT FILE SIZE
+# FORMAT SIZE
 # =========================================================
 
 def format_size(size):
@@ -113,13 +141,44 @@ def format_size(size):
 
     power = 1024
     n = 0
+
     units = ['B', 'KB', 'MB', 'GB']
 
     while size > power and n < len(units) - 1:
+
         size /= power
         n += 1
 
     return f"{round(size, 2)} {units[n]}"
+
+
+# =========================================================
+# ADMIN CHECK
+# =========================================================
+
+def is_admin(user_id):
+
+    return user_id == ADMIN_ID
+
+
+# =========================================================
+# FORCE JOIN CHECK
+# =========================================================
+
+async def check_force_join(user_id):
+
+    try:
+
+        await bot_client.get_permissions(
+            FORCE_CHANNEL,
+            user_id
+        )
+
+        return True
+
+    except:
+
+        return False
 
 
 # =========================================================
@@ -131,6 +190,7 @@ async def main():
     global user_client
     global bot_client
     global download_count
+    global private_mode
 
     print("╔════════════════════════════════════╗")
     print("║  🤖 Media Downloader Pro           ║")
@@ -138,7 +198,7 @@ async def main():
     print("╚════════════════════════════════════╝")
 
     # =====================================================
-    # START WEB SERVER
+    # WEB SERVER
     # =====================================================
 
     web_thread = threading.Thread(
@@ -148,20 +208,29 @@ async def main():
 
     web_thread.start()
 
-    logger.info("🌐 Serveur web démarré")
+    logger.warning("🌐 Serveur web démarré")
 
     # =====================================================
     # ENV VARIABLES
     # =====================================================
 
     API_ID = int(os.getenv("API_ID", "0"))
+
     API_HASH = os.getenv("API_HASH", "")
+
     BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+
     SESSION_STRING = os.getenv("SESSION_STRING", "")
 
-    if not all([API_ID, API_HASH, BOT_TOKEN, SESSION_STRING]):
+    if not all([
+        API_ID,
+        API_HASH,
+        BOT_TOKEN,
+        SESSION_STRING
+    ]):
 
         logger.error("❌ Variables Render manquantes")
+
         return
 
     # =====================================================
@@ -170,23 +239,32 @@ async def main():
 
     try:
 
-        logger.info("📱 Connexion utilisateur...")
+        logger.warning("📱 Connexion utilisateur...")
 
         user_client = TelegramClient(
             StringSession(SESSION_STRING),
             API_ID,
-            API_HASH
+            API_HASH,
+            connection=ConnectionTcpAbridged,
+            connection_retries=10,
+            retry_delay=2,
+            auto_reconnect=True,
+            sequential_updates=False,
+            flood_sleep_threshold=60
         )
 
         await user_client.start()
 
         me = await user_client.get_me()
 
-        logger.info(f"✅ Connecté : {me.first_name}")
+        logger.warning(f"✅ Connecté : {me.first_name}")
 
     except Exception as e:
 
-        logger.error(f"❌ Erreur connexion utilisateur : {e}")
+        logger.error(
+            f"❌ Erreur connexion utilisateur : {e}"
+        )
+
         return
 
     # =====================================================
@@ -195,12 +273,17 @@ async def main():
 
     try:
 
-        logger.info("🤖 Démarrage du bot...")
+        logger.warning("🤖 Démarrage du bot...")
 
         bot_client = TelegramClient(
             "bot",
             API_ID,
-            API_HASH
+            API_HASH,
+            connection=ConnectionTcpAbridged,
+            connection_retries=10,
+            retry_delay=2,
+            auto_reconnect=True,
+            sequential_updates=False
         )
 
         await bot_client.start(
@@ -209,9 +292,11 @@ async def main():
 
         bot_me = await bot_client.get_me()
 
-        logger.info(f"✅ Bot démarré : @{bot_me.username}")
+        logger.warning(
+            f"✅ Bot démarré : @{bot_me.username}"
+        )
 
-        logger.info("🚀 Bot lancé avec succès")
+        logger.warning("🚀 Bot lancé avec succès")
 
         # =================================================
         # /START
@@ -220,23 +305,86 @@ async def main():
         @bot_client.on(events.NewMessage(pattern="/start"))
         async def start_handler(event):
 
+            users.add(event.sender_id)
+
+            if not await check_force_join(event.sender_id):
+
+                await event.respond(
+                    "🚫 Vous devez rejoindre notre canal pour utiliser ce bot.",
+                    buttons=[
+                        [
+                            Button.url(
+                                "📢 Rejoindre le canal",
+                                "https://t.me/FichierHatunnelPlus"
+                            )
+                        ]
+                    ]
+                )
+
+                return
+
             await event.respond(
-                "╔══════════════════╗\n"
+                "🤖 Media Downloader Pro\n\n"
+                "📥 Envoie un lien Telegram\n\n"
+                "📚 /commandes"
+            )
+
+        # =================================================
+        # /COMMANDES
+        # =================================================
+
+        @bot_client.on(events.NewMessage(pattern="/commandes"))
+        async def commandes_handler(event):
+
+            await event.respond(
+                "📚 Commandes disponibles\n\n"
+
+                "/start\n"
+                "/help\n"
+                "/about\n"
+                "/ping\n"
+                "/uptime\n"
+                "/status\n"
+                "/stats\n"
+                "/users\n"
+                "/broadcast\n"
+                "/restart\n"
+                "/logs\n"
+                "/clear\n"
+                "/private\n"
+                "/ban\n"
+                "/unban"
+            )
+
+        # =================================================
+        # /HELP
+        # =================================================
+
+        @bot_client.on(events.NewMessage(pattern="/help"))
+        async def help_handler(event):
+
+            await event.respond(
+                "📥 Envoie un lien Telegram.\n\n"
+                "✅ Support :\n"
+                "📸 Photos\n"
+                "🎬 Vidéos\n"
+                "🎤 Vocaux\n"
+                "🎵 Audio\n"
+                "📄 Documents\n"
+                "📱 APK"
+            )
+
+        # =================================================
+        # /ABOUT
+        # =================================================
+
+        @bot_client.on(events.NewMessage(pattern="/about"))
+        async def about_handler(event):
+
+            await event.respond(
                 "🤖 Media Downloader Pro\n"
                 "👑 By 🇭 🇲 🇧\n"
-                "╚══════════════════╝\n\n"
-
-                "📥 Envoie un lien Telegram :\n"
-                "`https://t.me/c/1234567890/142`\n\n"
-
-                "✅ Support :\n"
-                "• 📸 Photos\n"
-                "• 🎬 Vidéos\n"
-                "• 🎵 Audio\n"
-                "• 🎤 Vocaux\n"
-                "• 📄 Documents\n"
-                "• 📱 APK\n"
-                "• 🔒 Canaux privés"
+                "⚡ Ultra Fast Version"
             )
 
         # =================================================
@@ -247,7 +395,7 @@ async def main():
         async def ping_handler(event):
 
             await event.respond(
-                "🏓 Pong!\n"
+                "🏓 Pong !\n"
                 "✅ Bot online"
             )
 
@@ -280,47 +428,234 @@ async def main():
             minutes = (uptime % 3600) // 60
 
             await event.respond(
-                "📊 Status du bot\n\n"
-                f"✅ Online\n"
+                "📊 Status\n\n"
                 f"📥 Téléchargements : {download_count}\n"
+                f"👥 Utilisateurs : {len(users)}\n"
                 f"⏳ Uptime : {hours}h {minutes}m"
             )
 
         # =================================================
-        # /ABOUT
+        # /USERS
         # =================================================
 
-        @bot_client.on(events.NewMessage(pattern="/about"))
-        async def about_handler(event):
+        @bot_client.on(events.NewMessage(pattern="/users"))
+        async def users_handler(event):
+
+            if not is_admin(event.sender_id):
+                return
 
             await event.respond(
-                "🤖 Media Downloader Pro\n"
-                "👑 Créé par 🇭 🇲 🇧\n"
-                "⚡ Powered by Telethon + Render"
+                f"👥 Utilisateurs : {len(users)}"
             )
 
         # =================================================
-        # /HELP
+        # /PRIVATE
         # =================================================
 
-        @bot_client.on(events.NewMessage(pattern="/help"))
-        async def help_handler(event):
+        @bot_client.on(events.NewMessage(pattern="/private"))
+        async def private_handler(event):
+
+            global private_mode
+
+            if not is_admin(event.sender_id):
+                return
+
+            private_mode = not private_mode
+
+            status = (
+                "Activé"
+                if private_mode
+                else "Désactivé"
+            )
 
             await event.respond(
-                "📖 Aide du bot\n\n"
+                f"🔒 Mode privé : {status}"
+            )
 
-                "📥 Envoie simplement un lien Telegram.\n\n"
+        # =================================================
+        # /CLEAR
+        # =================================================
 
-                "✅ Formats supportés :\n"
-                "• Photos\n"
-                "• Vidéos\n"
-                "• Vocaux\n"
-                "• Audio\n"
-                "• APK\n"
-                "• Documents\n\n"
+        @bot_client.on(events.NewMessage(pattern="/clear"))
+        async def clear_handler(event):
 
-                "📌 Exemple :\n"
-                "`https://t.me/c/1234567890/142`"
+            if not is_admin(event.sender_id):
+                return
+
+            try:
+
+                if os.path.exists(DOWNLOAD_DIR):
+
+                    shutil.rmtree(DOWNLOAD_DIR)
+
+                os.makedirs(
+                    DOWNLOAD_DIR,
+                    exist_ok=True
+                )
+
+                await event.respond(
+                    "🗑 Cache supprimé"
+                )
+
+            except Exception as e:
+
+                await event.respond(f"❌ {e}")
+
+        # =================================================
+        # /RESTART
+        # =================================================
+
+        @bot_client.on(events.NewMessage(pattern="/restart"))
+        async def restart_handler(event):
+
+            if not is_admin(event.sender_id):
+                return
+
+            await event.respond("♻️ Redémarrage...")
+
+            os.execl(
+                sys.executable,
+                sys.executable,
+                *sys.argv
+            )
+
+        # =================================================
+        # /LOGS
+        # =================================================
+
+        @bot_client.on(events.NewMessage(pattern="/logs"))
+        async def logs_handler(event):
+
+            if not is_admin(event.sender_id):
+                return
+
+            try:
+
+                if os.path.exists(LOG_FILE):
+
+                    with open(
+                        LOG_FILE,
+                        "r",
+                        encoding="utf-8",
+                        errors="ignore"
+                    ) as f:
+
+                        data = f.read()[-4000:]
+
+                    await event.respond(
+                        f"📄 Logs\n\n{data}"
+                    )
+
+                else:
+
+                    await event.respond(
+                        "⚠️ Aucun log"
+                    )
+
+            except Exception as e:
+
+                await event.respond(f"❌ {e}")
+
+        # =================================================
+        # /STATS
+        # =================================================
+
+        @bot_client.on(events.NewMessage(pattern="/stats"))
+        async def stats_handler(event):
+
+            total, used, free = shutil.disk_usage("/")
+
+            await event.respond(
+                "📊 Statistiques\n\n"
+                f"💾 Total : {format_size(total)}\n"
+                f"📦 Utilisé : {format_size(used)}\n"
+                f"🆓 Libre : {format_size(free)}\n"
+                f"📥 Téléchargements : {download_count}\n"
+                f"🖥 OS : {platform.system()}"
+            )
+
+        # =================================================
+        # /BAN
+        # =================================================
+
+        @bot_client.on(events.NewMessage(pattern=r"/ban (.+)"))
+        async def ban_handler(event):
+
+            if not is_admin(event.sender_id):
+                return
+
+            try:
+
+                user_id = int(
+                    event.pattern_match.group(1)
+                )
+
+                banned_users.add(user_id)
+
+                await event.respond(
+                    f"🚫 Banni : {user_id}"
+                )
+
+            except:
+
+                await event.respond("❌ /ban ID")
+
+        # =================================================
+        # /UNBAN
+        # =================================================
+
+        @bot_client.on(events.NewMessage(pattern=r"/unban (.+)"))
+        async def unban_handler(event):
+
+            if not is_admin(event.sender_id):
+                return
+
+            try:
+
+                user_id = int(
+                    event.pattern_match.group(1)
+                )
+
+                banned_users.discard(user_id)
+
+                await event.respond(
+                    f"✅ Débanni : {user_id}"
+                )
+
+            except:
+
+                await event.respond("❌ /unban ID")
+
+        # =================================================
+        # /BROADCAST
+        # =================================================
+
+        @bot_client.on(events.NewMessage(pattern=r"/broadcast (.+)"))
+        async def broadcast_handler(event):
+
+            if not is_admin(event.sender_id):
+                return
+
+            text = event.pattern_match.group(1)
+
+            success = 0
+
+            for user in users:
+
+                try:
+
+                    await bot_client.send_message(
+                        user,
+                        f"📢 {text}"
+                    )
+
+                    success += 1
+
+                except:
+                    pass
+
+            await event.respond(
+                f"✅ Envoyé à {success} utilisateurs"
             )
 
         # =================================================
@@ -332,27 +667,56 @@ async def main():
 
             global download_count
 
+            user_id = event.sender_id
+
+            users.add(user_id)
+
+            if not await check_force_join(user_id):
+
+                await event.respond(
+                    "🚫 Rejoignez le canal pour utiliser le bot.",
+                    buttons=[
+                        [
+                            Button.url(
+                                "📢 Rejoindre le canal",
+                                "https://t.me/FichierHatunnelPlus"
+                            )
+                        ]
+                    ]
+                )
+
+                return
+
+            if user_id in banned_users:
+
+                await event.respond(
+                    "🚫 Vous êtes bloqué"
+                )
+
+                return
+
+            if private_mode and not is_admin(user_id):
+
+                await event.respond(
+                    "🔒 Bot privé"
+                )
+
+                return
+
             url = event.text.strip()
 
             chat_id = event.chat_id
 
-            # =============================================
-            # CHECK TELEGRAM URL
-            # =============================================
-
             if "t.me/" not in url:
 
                 await event.respond(
-                    "❌ Seuls les liens Telegram sont acceptés"
+                    "❌ Lien Telegram uniquement"
                 )
 
                 return
 
             msg = await event.respond(
-                "╔══════════════╗\n"
-                "📥 Téléchargement\n"
-                "⏳ Veuillez patienter...\n"
-                "╚══════════════╝"
+                "📥 Téléchargement..."
             )
 
             try:
@@ -360,18 +724,10 @@ async def main():
                 channel_id = None
                 message_id = None
 
-                # =========================================
-                # PRIVATE LINKS
-                # =========================================
-
                 private_match = re.search(
                     r't\.me/c/(\d+)/(\d+)',
                     url
                 )
-
-                # =========================================
-                # PUBLIC LINKS
-                # =========================================
 
                 public_match = re.search(
                     r't\.me/([a-zA-Z0-9_]+)/(\d+)',
@@ -396,21 +752,11 @@ async def main():
                         public_match.group(2)
                     )
 
-                # =========================================
-                # INVALID LINK
-                # =========================================
-
                 if not channel_id:
 
-                    await msg.edit(
-                        "❌ Lien Telegram invalide"
-                    )
+                    await msg.edit("❌ Lien invalide")
 
                     return
-
-                # =========================================
-                # GET MESSAGE
-                # =========================================
 
                 entity = await user_client.get_entity(
                     channel_id
@@ -429,10 +775,6 @@ async def main():
 
                     return
 
-                # =========================================
-                # TEXT MESSAGE
-                # =========================================
-
                 if not message.media:
 
                     text = (
@@ -442,14 +784,21 @@ async def main():
                     )
 
                     await msg.edit(
-                        f"📝 Message :\n\n{text[:4000]}"
+                        f"📝 {text[:4000]}"
                     )
 
                     return
 
-                # =========================================
-                # MEDIA TYPE
-                # =========================================
+                if (
+                    message.file
+                    and message.file.size > MAX_FILE_SIZE
+                ):
+
+                    await msg.edit(
+                        "❌ Fichier trop volumineux"
+                    )
+
+                    return
 
                 media_type = "📄 Document"
 
@@ -465,49 +814,40 @@ async def main():
                 elif message.audio:
                     media_type = "🎵 Audio"
 
-                # =========================================
-                # FILE SIZE
-                # =========================================
-
                 file_size = "Inconnue"
 
                 if message.file:
+
                     file_size = format_size(
                         message.file.size
                     )
 
-                # =========================================
-                # DOWNLOAD
-                # =========================================
-
                 await msg.edit(
-                    f"{media_type} détecté\n"
-                    f"📦 Taille : {file_size}\n\n"
-                    "📥 Téléchargement..."
+                    f"{media_type}\n"
+                    f"📦 {file_size}\n\n"
+                    "⚡ Téléchargement rapide..."
                 )
 
                 start_download = time.time()
 
                 os.makedirs(
-                    "downloads",
+                    DOWNLOAD_DIR,
                     exist_ok=True
                 )
 
-                file_path = await message.download_media(
-                    file="downloads/"
+                file_path = await user_client.download_media(
+                    message,
+                    file=DOWNLOAD_DIR,
+                    thumb=None
                 )
 
                 if not file_path:
 
                     await msg.edit(
-                        "❌ Impossible de télécharger ce média"
+                        "❌ Téléchargement impossible"
                     )
 
                     return
-
-                # =========================================
-                # CAPTION
-                # =========================================
 
                 caption_text = (
                     message.text
@@ -520,23 +860,23 @@ async def main():
                     f"{caption_text}"
                 )[:1024]
 
-                # =========================================
-                # SEND FILE
-                # =========================================
+                supports_streaming = False
+
+                if message.video:
+                    supports_streaming = True
 
                 await bot_client.send_file(
                     entity=chat_id,
                     file=file_path,
-                    caption=caption
+                    caption=caption,
+                    supports_streaming=supports_streaming,
+                    allow_cache=True
                 )
-
-                # =========================================
-                # CLEANUP
-                # =========================================
 
                 try:
 
                     if os.path.exists(file_path):
+
                         os.remove(file_path)
 
                 except Exception as cleanup_error:
@@ -544,10 +884,6 @@ async def main():
                     logger.warning(
                         f"⚠️ Erreur suppression : {cleanup_error}"
                     )
-
-                # =========================================
-                # DOWNLOAD STATS
-                # =========================================
 
                 download_count += 1
 
@@ -570,14 +906,14 @@ async def main():
                 )
 
                 await msg.edit(
-                    "❌ Impossible de télécharger ce média"
+                    f"❌ Impossible de télécharger\n\n{e}"
                 )
 
         # =================================================
         # READY
         # =================================================
 
-        logger.info(
+        logger.warning(
             "🎯 Bot prêt ! En attente de liens..."
         )
 
@@ -606,4 +942,5 @@ async def main():
 # =========================================================
 
 if __name__ == "__main__":
+
     asyncio.run(main())
