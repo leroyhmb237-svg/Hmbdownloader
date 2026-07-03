@@ -6,3 +6,4 @@ aiohttp==3.12.14
 requests==2.32.4
 Pillow==11.3.0
 aiofiles==24.1.0
+cryptg==0.4.0
